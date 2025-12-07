@@ -5,6 +5,7 @@ import threading
 import time
 import appdirs
 import confuse
+import glob
 from configparser import ConfigParser
 from pathlib import Path
 from queue import Queue
@@ -44,6 +45,7 @@ class MPVMon(Monitor):
     def __init__(self, scrobble_queue):
         super().__init__(scrobble_queue)
         self.ipc_path = self.config['ipc_path']
+        self.resolved_ipc_path = None
         self.read_timeout = self.config['read_timeout']
         self.write_timeout = self.config['write_timeout']
         self.poll_interval = self.config['poll_interval']
@@ -200,15 +202,26 @@ class MPVPosixMon(MPVMon):
         super().__init__(scrobble_queue)
 
     def can_connect(self):
-        sock = socket.socket(socket.AF_UNIX)
-        errno = sock.connect_ex(self.ipc_path)
-        sock.close()
-        return errno == 0
+        if "*" in self.ipc_path:
+            for path in glob.glob(self.ipc_path):
+                sock = socket.socket(socket.AF_UNIX)
+                if sock.connect_ex(path) == 0:
+                    sock.close()
+                    self.resolved_ipc_path = path
+                    return True
+            return False
+        else:
+            sock = socket.socket(socket.AF_UNIX)
+            if sock.connect_ex(self.ipc_path) == 0:
+                sock.close()
+                self.resolved_ipc_path = self.ipc_path
+                return True
+            return False
 
     def conn_loop(self):
         sock = socket.socket(socket.AF_UNIX)
         try:
-            sock.connect(self.ipc_path)
+            sock.connect(self.resolved_ipc_path)
         except ConnectionRefusedError:
             logger.warning("Connection refused. Maybe we retried too soon?")
             return
