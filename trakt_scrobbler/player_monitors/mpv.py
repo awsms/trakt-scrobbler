@@ -221,10 +221,16 @@ class MPVPosixMon(MPVMon):
         This avoids TOCTOU by not doing "can_connect()" and later a separate connect().
         Wildcards are supported by expanding ipc_path with glob.
         """
+        candidates = []
+        if self.resolved_ipc_path:
+            candidates.append(self.resolved_ipc_path)
         if "*" in self.ipc_path:
-            candidates = sorted(glob.glob(self.ipc_path))
+            for path in sorted(glob.glob(self.ipc_path)):
+                if path not in candidates:
+                    candidates.append(path)
         else:
-            candidates = [self.ipc_path]
+            if self.ipc_path not in candidates:
+                candidates.append(self.ipc_path)
 
         for path in candidates:
             sock = socket.socket(socket.AF_UNIX)
@@ -280,6 +286,8 @@ class MPVPosixMon(MPVMon):
                 else:
                     self.write_queue.task_done()
         sock.close()
+        # Clear resolved path so reconnect can find a new IPC after mpv restarts.
+        self.resolved_ipc_path = None
         while not self.write_queue.empty():
             self.write_queue.get_nowait()
             self.write_queue.task_done()
