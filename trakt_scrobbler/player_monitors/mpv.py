@@ -57,6 +57,7 @@ class MPVMon(Monitor):
         self.sent_commands = {}
         self.command_counter = 1
         self.vars = {}
+        self.was_connected = False
 
     @classmethod
     def read_player_cfg(cls, auto_keys=None):
@@ -83,18 +84,20 @@ class MPVMon(Monitor):
                 sock = self._get_connection()
                 if sock is None:
                     logger.info('Unable to connect to MPV. Check ipc path.')
-                    time.sleep(self.poll_interval)
+                    self._sleep_before_retry()
                     continue
 
+                self.was_connected = True
                 self.update_vars()
                 self.conn_loop(sock)
             else:
                 if self.can_connect():
+                    self.was_connected = True
                     self.update_vars()
                     self.conn_loop()
                 else:
                     logger.info('Unable to connect to MPV. Check ipc path.')
-                    time.sleep(self.poll_interval)
+                    self._sleep_before_retry()
                     continue
 
             if self.vars.get('state', 0) != 0:
@@ -105,6 +108,12 @@ class MPVMon(Monitor):
             if self.poll_timer:
                 self.poll_timer.cancel()
             time.sleep(self.restart_delay)
+
+    def _sleep_before_retry(self):
+        retry_delay = self.poll_interval
+        if self.was_connected:
+            retry_delay = min(self.poll_interval, 1.0)
+        time.sleep(retry_delay)
 
     def update_status(self):
         if not self.WATCHED_PROPS.issubset(self.vars):
@@ -221,16 +230,25 @@ class MPVPosixMon(MPVMon):
         This avoids TOCTOU by not doing "can_connect()" and later a separate connect().
         Wildcards are supported by expanding ipc_path with glob.
         """
+        ipc_path = self.ipc_path
+        if os.path.isdir(ipc_path):
+            ipc_path = os.path.join(ipc_path, "*")
         candidates = []
         if self.resolved_ipc_path:
             candidates.append(self.resolved_ipc_path)
-        if "*" in self.ipc_path:
-            for path in sorted(glob.glob(self.ipc_path)):
+        if "*" in ipc_path:
+            globbed = glob.glob(ipc_path)
+            try:
+                globbed.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            except FileNotFoundError:
+                # Socket removed between glob and stat; leave unsorted.
+                pass
+            for path in globbed:
                 if path not in candidates:
                     candidates.append(path)
         else:
-            if self.ipc_path not in candidates:
-                candidates.append(self.ipc_path)
+            if ipc_path not in candidates:
+                candidates.append(ipc_path)
 
         for path in candidates:
             sock = socket.socket(socket.AF_UNIX)
