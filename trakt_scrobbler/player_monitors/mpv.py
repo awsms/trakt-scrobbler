@@ -78,20 +78,33 @@ class MPVMon(Monitor):
 
     def run(self):
         while True:
-            if self.can_connect():
+            # POSIX uses _get_connection() (connect = check), Windows keeps can_connect()
+            if os.name == 'posix':
+                sock = self._get_connection()
+                if sock is None:
+                    logger.info('Unable to connect to MPV. Check ipc path.')
+                    time.sleep(self.poll_interval)
+                    continue
+
                 self.update_vars()
-                self.conn_loop()
-                if self.vars.get('state', 0) != 0:
-                    # create a 'stop' event in case the player didn't send 'end-file'
-                    self.vars['state'] = 0
-                    self.update_status()
-                self.vars = {}
-                if self.poll_timer:
-                    self.poll_timer.cancel()
-                time.sleep(self.restart_delay)
+                self.conn_loop(sock)
             else:
-                logger.info('Unable to connect to MPV. Check ipc path.')
-                time.sleep(self.poll_interval)
+                if self.can_connect():
+                    self.update_vars()
+                    self.conn_loop()
+                else:
+                    logger.info('Unable to connect to MPV. Check ipc path.')
+                    time.sleep(self.poll_interval)
+                    continue
+
+            if self.vars.get('state', 0) != 0:
+                # create a 'stop' event in case the player didn't send 'end-file'
+                self.vars['state'] = 0
+                self.update_status()
+            self.vars = {}
+            if self.poll_timer:
+                self.poll_timer.cancel()
+            time.sleep(self.restart_delay)
 
     def update_status(self):
         if not self.WATCHED_PROPS.issubset(self.vars):
@@ -201,30 +214,41 @@ class MPVPosixMon(MPVMon):
     def __init__(self, scrobble_queue):
         super().__init__(scrobble_queue)
 
-    def can_connect(self):
-        if "*" in self.ipc_path:
-            for path in glob.glob(self.ipc_path):
-                sock = socket.socket(socket.AF_UNIX)
-                if sock.connect_ex(path) == 0:
-                    sock.close()
-                    self.resolved_ipc_path = path
-                    return True
-            return False
-        else:
-            sock = socket.socket(socket.AF_UNIX)
-            if sock.connect_ex(self.ipc_path) == 0:
-                sock.close()
-                self.resolved_ipc_path = self.ipc_path
-                return True
-            return False
+    def _get_connection(self):
+        """
+        Return an already-connected AF_UNIX socket, or None.
 
-    def conn_loop(self):
-        sock = socket.socket(socket.AF_UNIX)
-        try:
-            sock.connect(self.resolved_ipc_path)
-        except ConnectionRefusedError:
-            logger.warning("Connection refused. Maybe we retried too soon?")
-            return
+        This avoids TOCTOU by not doing "can_connect()" and later a separate connect().
+        Wildcards are supported by expanding ipc_path with glob.
+        """
+        if "*" in self.ipc_path:
+            candidates = sorted(glob.glob(self.ipc_path))
+        else:
+            candidates = [self.ipc_path]
+
+        for path in candidates:
+            sock = socket.socket(socket.AF_UNIX)
+            try:
+                sock.connect(path)
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
+                sock.close()
+                continue
+            else:
+                self.resolved_ipc_path = path
+                return sock
+
+        self.resolved_ipc_path = None
+        return None
+
+    # Kept for API compatibility; run() no longer uses it on POSIX.
+    def can_connect(self):
+        sock = self._get_connection()
+        if sock is None:
+            return False
+        sock.close()
+        return True
+
+    def conn_loop(self, sock):
         self.is_running = True
         sock_list = [sock]
         while self.is_running:
