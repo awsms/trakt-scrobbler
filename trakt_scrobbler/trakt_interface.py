@@ -116,7 +116,12 @@ def scrobble(verb, media_info, progress, *args, **kwargs):
 
     if scrobble_resp is not None:
         if scrobble_resp.status_code == HTTPStatus.NOT_FOUND:
-            logger.warning("Not found on trakt. The media info is incorrect.")
+            msg = (
+                "Not found on trakt (404). The media info is likely incorrect: "
+                f"{media_info!r}"
+            )
+            logger.warning(msg)
+            notify(msg, category="trakt")
             return None
         elif scrobble_resp.status_code == HTTPStatus.CONFLICT:
             logger.warning("Scrobble already exists on trakt server.")

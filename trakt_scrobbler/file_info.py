@@ -164,7 +164,27 @@ def cleanup_guess(guess):
             logger.warning(msg)
             notify(msg)
             return None
-        guess['season'] = int(season)
+
+        # Heuristic: guessit sometimes interprets a year folder (e.g. ".../Show.2015/.../E03.mkv")
+        # as the season number, yielding season==year (often >= 1900). This causes trakt episode
+        # lookups to 404. In that common case, treat the season as 1.
+        season_i = int(season)
+        year = guess.get('year')
+        if year is not None:
+            try:
+                year_i = int(year)
+            except (TypeError, ValueError):
+                year_i = None
+            if year_i is not None and season_i >= 1900 and season_i == year_i:
+                logger.warning(
+                    "Guessit returned season=%s matching year=%s for an episode; "
+                    "treating season as 1. (This is usually caused by a year in a parent folder.)",
+                    season_i,
+                    year_i,
+                )
+                season_i = 1
+
+        guess['season'] = season_i
         # if it came from regex, this might be a string
         try:
             guess['episode'] = int(guess['episode'])
