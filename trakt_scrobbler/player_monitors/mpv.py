@@ -58,6 +58,8 @@ class MPVMon(Monitor):
         self.command_counter = 1
         self.vars = {}
         self.was_connected = False
+        self._rescan_requested = False
+        self._last_rescan = 0.0
 
     @classmethod
     def read_player_cfg(cls, auto_keys=None):
@@ -136,6 +138,11 @@ class MPVMon(Monitor):
             'duration': self.vars['duration'],
             'time': time.time()
         }
+        if self.status['state'] != 2 and hasattr(self, "_has_multiple_ipc_candidates"):
+            now = time.time()
+            if self._has_multiple_ipc_candidates() and now - self._last_rescan >= self.poll_interval:
+                self._rescan_requested = True
+                self._last_rescan = now
         self.handle_status_update()
 
     def update_vars(self):
@@ -230,11 +237,51 @@ class MPVPosixMon(MPVMon):
         This avoids TOCTOU by not doing "can_connect()" and later a separate connect().
         Wildcards are supported by expanding ipc_path with glob.
         """
+        candidates = self._list_ipc_candidates()
+        fallback_sock = None
+        fallback_path = None
+        fallback_vars = None
+
+        for path in candidates:
+            sock = socket.socket(socket.AF_UNIX)
+            try:
+                sock.connect(path)
+            except (FileNotFoundError, ConnectionRefusedError, OSError):
+                sock.close()
+                continue
+
+            if len(candidates) > 1:
+                is_playing, vars_ = self._probe_socket(sock)
+                if is_playing:
+                    self.resolved_ipc_path = path
+                    if vars_:
+                        self.vars = vars_
+                    return sock
+                if fallback_sock is None:
+                    fallback_sock = sock
+                    fallback_path = path
+                    fallback_vars = vars_
+                else:
+                    sock.close()
+            else:
+                self.resolved_ipc_path = path
+                return sock
+
+        if fallback_sock is not None:
+            self.resolved_ipc_path = fallback_path
+            if fallback_vars:
+                self.vars = fallback_vars
+            return fallback_sock
+
+        self.resolved_ipc_path = None
+        return None
+
+    def _list_ipc_candidates(self, include_resolved=True):
         ipc_path = self.ipc_path
         if os.path.isdir(ipc_path):
             ipc_path = os.path.join(ipc_path, "*")
         candidates = []
-        if self.resolved_ipc_path:
+        if include_resolved and self.resolved_ipc_path:
             candidates.append(self.resolved_ipc_path)
         if "*" in ipc_path:
             globbed = glob.glob(ipc_path)
@@ -249,20 +296,63 @@ class MPVPosixMon(MPVMon):
         else:
             if ipc_path not in candidates:
                 candidates.append(ipc_path)
+        return candidates
 
-        for path in candidates:
-            sock = socket.socket(socket.AF_UNIX)
-            try:
-                sock.connect(path)
-            except (FileNotFoundError, ConnectionRefusedError, OSError):
-                sock.close()
-                continue
-            else:
-                self.resolved_ipc_path = path
-                return sock
+    def _has_multiple_ipc_candidates(self):
+        candidates = self._list_ipc_candidates(include_resolved=False)
+        return len(candidates) > 1
 
-        self.resolved_ipc_path = None
-        return None
+    def _probe_socket(self, sock):
+        """Return (is_playing, vars) for a connected socket."""
+        buffer = b""
+        sent_commands = {}
+        command_counter = 1
+        updated_props_count = 0
+        vars_ = {}
+
+        for prop in self.WATCHED_PROPS:
+            command = {'command': ['get_property', prop], 'request_id': command_counter}
+            sent_commands[command_counter] = ['get_property', prop]
+            command_counter += 1
+            sock.sendall(str.encode(json.dumps(command) + '\n'))
+
+        deadline = time.time() + self.read_timeout
+        while time.time() < deadline and updated_props_count < len(self.WATCHED_PROPS):
+            timeout = max(0.0, deadline - time.time())
+            r, _, _ = select.select([sock], [], [], timeout)
+            if not r:
+                break
+            data = sock.recv(4096)
+            if not data:
+                break
+            buffer += data
+            partial_line = b""
+            for line in buffer.splitlines(keepends=True):
+                if not line.endswith(b"\n"):
+                    partial_line = line
+                    continue
+                try:
+                    resp = json.loads(line.decode(encoding='utf-8', errors='ignore'))
+                except json.JSONDecodeError:
+                    continue
+                if 'request_id' not in resp:
+                    continue
+                command = sent_commands.get(resp['request_id'])
+                if not command or resp.get('error') != 'success':
+                    continue
+                if command[0] != 'get_property':
+                    continue
+                param = command[1]
+                data_val = resp.get('data')
+                if param == 'pause':
+                    vars_['state'] = 1 if data_val else 2
+                if param in self.WATCHED_PROPS:
+                    vars_[param] = data_val
+                    updated_props_count += 1
+            buffer = partial_line
+
+        is_playing = vars_.get('state') == 2 and vars_.get('duration')
+        return is_playing, vars_
 
     # Kept for API compatibility; run() no longer uses it on POSIX.
     def can_connect(self):
@@ -303,6 +393,10 @@ class MPVPosixMon(MPVMon):
                     break
                 else:
                     self.write_queue.task_done()
+            if self._rescan_requested:
+                self._rescan_requested = False
+                self.is_running = False
+                break
         sock.close()
         # Clear resolved path so reconnect can find a new IPC after mpv restarts.
         self.resolved_ipc_path = None
