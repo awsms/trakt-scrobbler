@@ -61,6 +61,15 @@ class MPVMon(Monitor):
         self._rescan_requested = False
         self._last_rescan = 0.0
 
+    def reset_ipc_state(self):
+        # A reconnect should start with a clean request/response mapping.
+        self.buffer = b''
+        self.sent_commands = {}
+        self.command_counter = 1
+        while not self.write_queue.empty():
+            self.write_queue.get_nowait()
+            self.write_queue.task_done()
+
     @classmethod
     def read_player_cfg(cls, auto_keys=None):
         if sys.platform == "darwin":
@@ -90,11 +99,13 @@ class MPVMon(Monitor):
                     continue
 
                 self.was_connected = True
+                self.reset_ipc_state()
                 self.update_vars()
                 self.conn_loop(sock)
             else:
                 if self.can_connect():
                     self.was_connected = True
+                    self.reset_ipc_state()
                     self.update_vars()
                     self.conn_loop()
                 else:
@@ -172,7 +183,10 @@ class MPVMon(Monitor):
             self.update_vars()
 
     def handle_cmd_response(self, resp):
-        command = self.sent_commands.pop(resp['request_id'])
+        command = self.sent_commands.pop(resp['request_id'], None)
+        if command is None:
+            logger.debug(f"Ignoring response for unknown request_id={resp['request_id']}")
+            return
         if resp['error'] != 'success':
             logger.error(f'Error with command {command!s}. Response: {resp!s}')
             return
