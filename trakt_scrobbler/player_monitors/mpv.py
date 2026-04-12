@@ -60,6 +60,7 @@ class MPVMon(Monitor):
         self.was_connected = False
         self._rescan_requested = False
         self._last_rescan = 0.0
+        self._reconnect_requested = False
 
     def reset_ipc_state(self):
         # A reconnect should start with a clean request/response mapping.
@@ -113,10 +114,11 @@ class MPVMon(Monitor):
                     self._sleep_before_retry()
                     continue
 
-            if self.vars.get('state', 0) != 0:
+            if not self._reconnect_requested and self.vars.get('state', 0) != 0:
                 # create a 'stop' event in case the player didn't send 'end-file'
                 self.vars['state'] = 0
                 self.update_status()
+            self._reconnect_requested = False
             self.vars = {}
             if self.poll_timer:
                 self.poll_timer.cancel()
@@ -252,9 +254,7 @@ class MPVPosixMon(MPVMon):
         Wildcards are supported by expanding ipc_path with glob.
         """
         candidates = self._list_ipc_candidates()
-        fallback_sock = None
-        fallback_path = None
-        fallback_vars = None
+        probed = []
 
         for path in candidates:
             sock = socket.socket(socket.AF_UNIX)
@@ -264,31 +264,85 @@ class MPVPosixMon(MPVMon):
                 sock.close()
                 continue
 
-            if len(candidates) > 1:
-                is_playing, vars_ = self._probe_socket(sock)
-                if is_playing:
-                    self.resolved_ipc_path = path
-                    if vars_:
-                        self.vars = vars_
-                    return sock
-                if fallback_sock is None:
-                    fallback_sock = sock
-                    fallback_path = path
-                    fallback_vars = vars_
-                else:
-                    sock.close()
-            else:
+            if len(candidates) == 1:
                 self.resolved_ipc_path = path
                 return sock
 
-        if fallback_sock is not None:
-            self.resolved_ipc_path = fallback_path
-            if fallback_vars:
-                self.vars = fallback_vars
-            return fallback_sock
+            is_playing, vars_ = self._probe_socket(sock)
+            yield_candidate = {
+                "path": path,
+                "sock": sock,
+                "is_playing": is_playing,
+                "vars": vars_,
+                "meta": self._describe_socket(vars_),
+            }
+            probed.append(yield_candidate)
+
+        if probed:
+            best = self._choose_candidate(probed)
+            for candidate in probed:
+                if candidate is not best:
+                    candidate["sock"].close()
+            self.resolved_ipc_path = best["path"]
+            if best["vars"]:
+                self.vars = best["vars"]
+            return best["sock"]
 
         self.resolved_ipc_path = None
         return None
+
+    def _normalize_path(self, vars_):
+        path = vars_.get('path')
+        if not path:
+            return None
+        if not is_url(path) and not Path(path).is_absolute():
+            working_dir = vars_.get('working-directory')
+            if not working_dir:
+                return None
+            path = str(Path(working_dir) / path)
+        return path
+
+    def _describe_socket(self, vars_):
+        filepath = self._normalize_path(vars_)
+        media_info = None
+        if filepath:
+            try:
+                media_info = self.parse_status({
+                    'state': vars_.get('state', 0),
+                    'filepath': filepath,
+                    'position': vars_.get('time-pos') or 0,
+                    'duration': vars_.get('duration'),
+                }).get('media_info')
+            except Exception:
+                logger.debug(f"Failed to parse media info for socket {filepath!r}", exc_info=True)
+        return {
+            'filepath': filepath,
+            'media_info': media_info,
+            'position': vars_.get('time-pos'),
+            'state': vars_.get('state'),
+            'duration': vars_.get('duration'),
+        }
+
+    def _choose_candidate(self, candidates):
+        ref_filepath = self.status.get('filepath')
+        ref_position = self.status.get('position')
+        ref_media = self.prev_state.get('media_info') if self.prev_state else None
+
+        def score(candidate):
+            meta = candidate["meta"]
+            same_filepath = bool(ref_filepath and meta['filepath'] == ref_filepath)
+            same_media = bool(ref_media and meta['media_info'] == ref_media)
+            pos_delta = float('inf')
+            if ref_position is not None and meta['position'] is not None:
+                pos_delta = abs(meta['position'] - ref_position)
+            return (
+                candidate["is_playing"],
+                same_filepath,
+                same_media,
+                -pos_delta,
+            )
+
+        return max(candidates, key=score)
 
     def _list_ipc_candidates(self, include_resolved=True):
         ipc_path = self.ipc_path
@@ -409,6 +463,7 @@ class MPVPosixMon(MPVMon):
                     self.write_queue.task_done()
             if self._rescan_requested:
                 self._rescan_requested = False
+                self._reconnect_requested = True
                 self.is_running = False
                 break
         sock.close()
